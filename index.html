@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cars Cars</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #1a1a2e;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: none;
+    }
+
+    video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline></video>
+  <canvas id="gameCanvas"></canvas>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/vision_bundle.mjs";
+
+    // =========================================================
+    // CONFIG
+    // =========================================================
+    const CFG = {
+      // Difficulty (gentle ramp for toddlers)
+      baseCarsPerSec: 0.35,
+      difficultyInterval: 60000,
+      difficultySpawnMult: 1.06,
+      difficultySpeedMult: 1.04,
+      maxDifficultyTier: 5,
+
+      // Cars (big and slow for toddlers)
+      carTypes: [
+        { name: "green",     color: "#4caf50", accent: "#388e3c", wheelColor: "#222", size: 70,  speed: [1.2, 2.0], points: 1, weight: 5 },
+        { name: "rainbow",   color: "rainbow",  accent: "#ff6f00", wheelColor: "#333", size: 90,  speed: [0.9, 1.6], points: 2, weight: 3 },
+        { name: "tesla",     color: "#e0e0e0", accent: "#42a5f5", wheelColor: "#111", size: 110, speed: [0.7, 1.3], points: 3, weight: 2 },
+        { name: "cybertruck", color: "#9e9e9e", accent: "#607d8b", wheelColor: "#111", size: 140, speed: [0.4, 0.9], points: 5, weight: 1 },
+      ],
+
+      // Player (forgiving for little kids)
+      lives: 8,
+      mouthOpenThreshold: 0.3,
+      catchRadius: 110,
+      chompCooldown: 300,
+
+      // City
+      buildingCount: 12,
+      streetlightCount: 6,
+
+      // Face landmark indices
+      UPPER_LIP: 13,
+      LOWER_LIP: 14,
+    };
+
+    // =========================================================
+    // AUDIO ENGINE
+    // =========================================================
+    class AudioEngine {
+      constructor() { this.ctx = null; this.ready = false; }
+
+      init() {
+        if (this.ready) return;
+        try {
+          this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+          this.ready = true;
+        } catch (e) {}
+      }
+
+      honk() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = "square";
+        osc.frequency.setValueAtTime(440, now);
+        osc.frequency.setValueAtTime(380, now + 0.08);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.25, now);
+        g.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+        osc.connect(g).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.2);
+      }
+
+      vroom() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(80, now);
+        osc.frequency.exponentialRampToValueAtTime(200, now + 0.15);
+        osc.frequency.exponentialRampToValueAtTime(60, now + 0.3);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.2, now);
+        g.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+        osc.connect(g).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.3);
+
+        // add rumble
+        const sr = this.ctx.sampleRate;
+        const buf = this.ctx.createBuffer(1, sr * 0.15, sr);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.15 * (1 - i / d.length);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        const lp = this.ctx.createBiquadFilter();
+        lp.type = "lowpass";
+        lp.frequency.value = 300;
+        const g2 = this.ctx.createGain();
+        g2.gain.setValueAtTime(0.3, now);
+        g2.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+        src.connect(lp).connect(g2).connect(this.ctx.destination);
+        src.start(now);
+        src.stop(now + 0.15);
+      }
+
+      screech() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(1200, now);
+        osc.frequency.exponentialRampToValueAtTime(400, now + 0.35);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.15, now);
+        g.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+        osc.connect(g).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.35);
+      }
+
+      gameOver() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        // crash thud
+        const sr = this.ctx.sampleRate;
+        const buf = this.ctx.createBuffer(1, sr * 0.4, sr);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.4 * (1 - i / d.length);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        const lp = this.ctx.createBiquadFilter();
+        lp.type = "lowpass";
+        lp.frequency.value = 200;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.4, now);
+        g.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+        src.connect(lp).connect(g).connect(this.ctx.destination);
+        src.start(now);
+        src.stop(now + 0.4);
+        // descending tone
+        const notes = [300, 250, 180, 120];
+        notes.forEach((f, i) => {
+          const o = this.ctx.createOscillator();
+          o.type = "triangle";
+          o.frequency.value = f;
+          const gg = this.ctx.createGain();
+          gg.gain.setValueAtTime(0.2, now + i * 0.15);
+          gg.gain.exponentialRampToValueAtTime(0.01, now + i * 0.15 + 0.15);
+          o.connect(gg).connect(this.ctx.destination);
+          o.start(now + i * 0.15);
+          o.stop(now + i * 0.15 + 0.17);
+        });
+      }
+
+      pop() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(600, now);
+        osc.frequency.exponentialRampToValueAtTime(300, now + 0.05);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.12, now);
+        g.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+        osc.connect(g).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.06);
+      }
+    }
+
+    const audio = new AudioEngine();
+
+    // =========================================================
+    // STATE
+    // =========================================================
+    const state = {
+      phase: "start",
+      score: 0,
+      lives: CFG.lives,
+      highScore: parseInt(localStorage.getItem("carsCars_high") || "0"),
+      cars: [],
+      buildings: [],
+      streetlights: [],
+      particles: [],
+      mouths: [],
+      difficultyTier: 0,
+      lastDifficultyUp: 0,
+      spawnAccum: 0,
+      gameStartTime: 0,
+      catchFlash: null,
+      combo: 0,
+      lastCatchTime: 0,
+      shakeUntil: 0,
+      laneOffset: 0,
+    };
+
+    // =========================================================
+    // CANVAS + VIDEO
+    // =========================================================
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    const video = document.getElementById("webcam");
+
+    let W, H;
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+      initBuildings();
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    // =========================================================
+    // MEDIAPIPE
+    // =========================================================
+    let faceLandmarker = null;
+    let modelReady = false;
+    let lastDetectionTime = 0;
+    const DETECTION_INTERVAL = 50;
+
+    async function initMediaPipe() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU",
+          },
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: false,
+          runningMode: "VIDEO",
+          numFaces: 4,
+        });
+        modelReady = true;
+      } catch (e) {
+        console.error("MediaPipe init failed:", e);
+        try {
+          const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
+          );
+          faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+              delegate: "CPU",
+            },
+            outputFaceBlendshapes: true,
+            runningMode: "VIDEO",
+            numFaces: 4,
+          });
+          modelReady = true;
+        } catch (e2) {
+          console.error("MediaPipe CPU fallback failed:", e2);
+        }
+      }
+    }
+
+    // =========================================================
+    // WEBCAM
+    // =========================================================
+    let camReady = false;
+
+    async function initWebcam() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await new Promise(r => { video.onloadedmetadata = r; });
+        await video.play();
+        camReady = true;
+      } catch (e) {
+        console.error("Webcam access failed:", e);
+      }
+    }
+
+    // =========================================================
+    // FACE / MOUTH DETECTION (multi-face)
+    // =========================================================
+    function detectFace(now) {
+      if (!modelReady || !camReady) return;
+      if (now - lastDetectionTime < DETECTION_INTERVAL) return;
+      lastDetectionTime = now;
+
+      const results = faceLandmarker.detectForVideo(video, now);
+      if (!results || !results.faceLandmarks || results.faceLandmarks.length === 0) {
+        state.mouths = [];
+        return;
+      }
+
+      const prevMouths = state.mouths;
+      const newMouths = [];
+
+      for (let fi = 0; fi < results.faceLandmarks.length; fi++) {
+        const lm = results.faceLandmarks[fi];
+        const upperLip = lm[CFG.UPPER_LIP];
+        const lowerLip = lm[CFG.LOWER_LIP];
+        const mouthX = 1 - (upperLip.x + lowerLip.x) / 2;
+        const mouthY = (upperLip.y + lowerLip.y) / 2;
+
+        let jawOpen = 0;
+        if (results.faceBlendshapes && results.faceBlendshapes[fi]) {
+          for (const bs of results.faceBlendshapes[fi].categories) {
+            if (bs.categoryName === "jawOpen") { jawOpen = bs.score; break; }
+          }
+        }
+
+        const isOpen = jawOpen > CFG.mouthOpenThreshold;
+
+        let lastChompTime = 0;
+        let wasMouthOpen = false;
+        let bestDist = Infinity;
+        for (const pm of prevMouths) {
+          const dx = mouthX - pm.x;
+          const dy = mouthY - pm.y;
+          const d = dx * dx + dy * dy;
+          if (d < bestDist) { bestDist = d; lastChompTime = pm.lastChompTime; wasMouthOpen = pm.mouthOpen; }
+        }
+
+        const mouth = { x: mouthX, y: mouthY, jawOpenVal: jawOpen, mouthOpen: isOpen, lastChompTime };
+
+        if (isOpen && !wasMouthOpen && state.phase === "playing") {
+          const timeSinceChomp = now - mouth.lastChompTime;
+          if (timeSinceChomp > CFG.chompCooldown) {
+            mouth.lastChompTime = now;
+            attemptCatch(mouthX * W, mouthY * H, now);
+          }
+        }
+
+        newMouths.push(mouth);
+      }
+
+      state.mouths = newMouths;
+    }
+
+    // =========================================================
+    // CAR CLASS
+    // =========================================================
+    class Car {
+      constructor(tier) {
+        const type = CFG.carTypes[tier];
+        this.type = type;
+        this.size = type.size;
+        this.points = type.points;
+        this.caught = false;
+        this.offscreen = false;
+
+        const speedMult = Math.pow(CFG.difficultySpeedMult, state.difficultyTier);
+        const baseSpeed = type.speed[0] + Math.random() * (type.speed[1] - type.speed[0]);
+        this.speed = baseSpeed * speedMult;
+
+        this._spawnFromEdge();
+        this.wheelPhase = Math.random() * Math.PI * 2;
+        this.rainbowPhase = Math.random() * 360;
+      }
+
+      _spawnFromEdge() {
+        const edge = Math.floor(Math.random() * 4);
+        const margin = this.size;
+        switch (edge) {
+          case 0:
+            this.x = -margin; this.y = margin + Math.random() * (H - margin * 2);
+            this.angle = -0.3 + Math.random() * 0.6;
+            break;
+          case 1:
+            this.x = W + margin; this.y = margin + Math.random() * (H - margin * 2);
+            this.angle = Math.PI - 0.3 + Math.random() * 0.6;
+            break;
+          case 2:
+            this.x = margin + Math.random() * (W - margin * 2); this.y = -margin;
+            this.angle = Math.PI / 2 - 0.3 + Math.random() * 0.6;
+            break;
+          case 3:
+            this.x = margin + Math.random() * (W - margin * 2); this.y = H + margin;
+            this.angle = -Math.PI / 2 - 0.3 + Math.random() * 0.6;
+            break;
+        }
+        this.facingLeft = Math.cos(this.angle) < 0;
+      }
+
+      update(dt) {
+        this.x += Math.cos(this.angle) * this.speed;
+        this.y += Math.sin(this.angle) * this.speed;
+        this.wheelPhase += dt * this.speed * 3;
+        this.rainbowPhase += dt * 120;
+        const m = this.size * 3;
+        if (this.x < -m || this.x > W + m || this.y < -m || this.y > H + m) this.offscreen = true;
+      }
+
+      draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        const dir = this.facingLeft ? -1 : 1;
+        ctx.scale(dir, 1);
+
+        const s = this.size;
+
+        if (this.type.name === "cybertruck") {
+          this._drawCybertruck(ctx, s);
+        } else if (this.type.name === "tesla") {
+          this._drawTesla(ctx, s);
+        } else {
+          this._drawSedan(ctx, s);
+        }
+
+        ctx.restore();
+      }
+
+      _drawSedan(ctx, s) {
+        const bodyColor = this.type.name === "rainbow" ? this._rainbowGrad(ctx, s) : this.type.color;
+
+        // Body
+        ctx.fillStyle = bodyColor;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.5, s * 0.1);
+        ctx.lineTo(-s * 0.45, -s * 0.1);
+        ctx.lineTo(-s * 0.2, -s * 0.25);
+        ctx.lineTo(s * 0.2, -s * 0.25);
+        ctx.lineTo(s * 0.45, -s * 0.1);
+        ctx.lineTo(s * 0.5, s * 0.1);
+        ctx.lineTo(s * 0.5, s * 0.2);
+        ctx.lineTo(-s * 0.5, s * 0.2);
+        ctx.closePath();
+        ctx.fill();
+
+        // Roof
+        ctx.fillStyle = this.type.name === "rainbow" ? "rgba(255,255,255,0.2)" : this._darken(this.type.color, 30);
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.18, -s * 0.25);
+        ctx.lineTo(-s * 0.1, -s * 0.38);
+        ctx.lineTo(s * 0.15, -s * 0.38);
+        ctx.lineTo(s * 0.22, -s * 0.25);
+        ctx.closePath();
+        ctx.fill();
+
+        // Windows
+        ctx.fillStyle = "rgba(100, 180, 255, 0.6)";
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.15, -s * 0.24);
+        ctx.lineTo(-s * 0.08, -s * 0.35);
+        ctx.lineTo(s * 0.13, -s * 0.35);
+        ctx.lineTo(s * 0.19, -s * 0.24);
+        ctx.closePath();
+        ctx.fill();
+
+        // Headlights
+        ctx.fillStyle = "#ffeb3b";
+        ctx.beginPath();
+        ctx.arc(s * 0.47, 0, s * 0.04, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Taillights
+        ctx.fillStyle = "#f44336";
+        ctx.beginPath();
+        ctx.arc(-s * 0.47, 0, s * 0.035, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Wheels
+        this._drawWheels(ctx, s, [-s * 0.3, s * 0.3], s * 0.2);
+      }
+
+      _drawTesla(ctx, s) {
+        // Sleek body
+        ctx.fillStyle = this.type.color;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.5, s * 0.08);
+        ctx.quadraticCurveTo(-s * 0.48, -s * 0.15, -s * 0.25, -s * 0.2);
+        ctx.lineTo(s * 0.25, -s * 0.2);
+        ctx.quadraticCurveTo(s * 0.48, -s * 0.15, s * 0.52, s * 0.05);
+        ctx.lineTo(s * 0.52, s * 0.18);
+        ctx.lineTo(-s * 0.5, s * 0.18);
+        ctx.closePath();
+        ctx.fill();
+
+        // Roof (glass)
+        ctx.fillStyle = "rgba(66, 165, 245, 0.4)";
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.2, -s * 0.2);
+        ctx.quadraticCurveTo(-s * 0.1, -s * 0.38, s * 0.05, -s * 0.38);
+        ctx.quadraticCurveTo(s * 0.2, -s * 0.38, s * 0.25, -s * 0.2);
+        ctx.closePath();
+        ctx.fill();
+
+        // Blue accent stripe
+        ctx.strokeStyle = this.type.accent;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.48, s * 0.0);
+        ctx.lineTo(s * 0.5, s * 0.0);
+        ctx.stroke();
+
+        // Headlights (LED strip)
+        ctx.fillStyle = "#e3f2fd";
+        ctx.fillRect(s * 0.44, -s * 0.08, s * 0.06, s * 0.03);
+        ctx.fillRect(s * 0.44, s * 0.04, s * 0.06, s * 0.03);
+
+        // Taillights (LED strip)
+        ctx.fillStyle = "#ef5350";
+        ctx.fillRect(-s * 0.5, -s * 0.06, s * 0.04, s * 0.12);
+
+        // Wheels
+        this._drawWheels(ctx, s, [-s * 0.32, s * 0.32], s * 0.18);
+      }
+
+      _drawCybertruck(ctx, s) {
+        // Angular body
+        ctx.fillStyle = this.type.color;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.5, s * 0.15);
+        ctx.lineTo(-s * 0.45, -s * 0.05);
+        ctx.lineTo(-s * 0.2, -s * 0.3);
+        ctx.lineTo(s * 0.35, -s * 0.3);
+        ctx.lineTo(s * 0.52, -s * 0.05);
+        ctx.lineTo(s * 0.52, s * 0.15);
+        ctx.closePath();
+        ctx.fill();
+
+        // Edge highlight (stainless steel effect)
+        ctx.strokeStyle = "rgba(255,255,255,0.3)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.45, -s * 0.05);
+        ctx.lineTo(-s * 0.2, -s * 0.3);
+        ctx.lineTo(s * 0.35, -s * 0.3);
+        ctx.lineTo(s * 0.52, -s * 0.05);
+        ctx.stroke();
+
+        // Dark window band
+        ctx.fillStyle = "rgba(30, 30, 30, 0.8)";
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.15, -s * 0.28);
+        ctx.lineTo(s * 0.3, -s * 0.28);
+        ctx.lineTo(s * 0.42, -s * 0.12);
+        ctx.lineTo(-s * 0.3, -s * 0.12);
+        ctx.closePath();
+        ctx.fill();
+
+        // Light bar
+        ctx.fillStyle = "#e0e0e0";
+        ctx.fillRect(s * 0.44, -s * 0.1, s * 0.07, s * 0.04);
+
+        // Taillights
+        ctx.fillStyle = "#f44336";
+        ctx.fillRect(-s * 0.5, -s * 0.02, s * 0.04, s * 0.1);
+
+        // Bed
+        ctx.fillStyle = this._darken(this.type.color, 20);
+        ctx.fillRect(-s * 0.48, -s * 0.05, s * 0.28, s * 0.2);
+
+        // Wheels (bigger)
+        this._drawWheels(ctx, s, [-s * 0.35, s * 0.35], s * 0.22);
+      }
+
+      _drawWheels(ctx, s, positions, yPos) {
+        const wheelR = s * 0.08;
+        for (const wx of positions) {
+          // Tire
+          ctx.fillStyle = "#222";
+          ctx.beginPath();
+          ctx.arc(wx, yPos, wheelR, 0, Math.PI * 2);
+          ctx.fill();
+          // Hub
+          ctx.fillStyle = "#666";
+          ctx.beginPath();
+          ctx.arc(wx, yPos, wheelR * 0.5, 0, Math.PI * 2);
+          ctx.fill();
+          // Spoke (rotating)
+          ctx.strokeStyle = "#888";
+          ctx.lineWidth = 1.5;
+          for (let i = 0; i < 3; i++) {
+            const a = this.wheelPhase + (i * Math.PI * 2) / 3;
+            ctx.beginPath();
+            ctx.moveTo(wx, yPos);
+            ctx.lineTo(wx + Math.cos(a) * wheelR * 0.45, yPos + Math.sin(a) * wheelR * 0.45);
+            ctx.stroke();
+          }
+        }
+      }
+
+      _rainbowGrad(ctx, s) {
+        const grad = ctx.createLinearGradient(-s * 0.5, 0, s * 0.5, 0);
+        const phase = this.rainbowPhase;
+        for (let i = 0; i <= 6; i++) {
+          const hue = (phase + i * 60) % 360;
+          grad.addColorStop(i / 6, `hsl(${hue}, 90%, 55%)`);
+        }
+        return grad;
+      }
+
+      _darken(hex, amount) {
+        const num = parseInt(hex.replace("#", ""), 16);
+        const r = Math.max(0, (num >> 16) - amount);
+        const g = Math.max(0, ((num >> 8) & 0xff) - amount);
+        const b = Math.max(0, (num & 0xff) - amount);
+        return `rgb(${r},${g},${b})`;
+      }
+
+      hitTest(px, py) {
+        const dx = px - this.x;
+        const dy = py - this.y;
+        const hitRadius = this.size * 0.45 + CFG.catchRadius * 0.3;
+        return dx * dx + dy * dy < hitRadius * hitRadius;
+      }
+    }
+
+    // =========================================================
+    // CITY BACKGROUND
+    // =========================================================
+    function initBuildings() {
+      state.buildings = [];
+      let x = 0;
+      while (x < W + 100) {
+        const w = 40 + Math.random() * 80;
+        const h = 60 + Math.random() * 160;
+        const windows = [];
+        const cols = Math.floor(w / 18);
+        const rows = Math.floor(h / 22);
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (Math.random() > 0.4) {
+              windows.push({
+                x: 6 + c * 18,
+                y: 8 + r * 22,
+                lit: Math.random() > 0.35,
+                color: Math.random() > 0.7 ? "#fff4c8" : "#ffe082",
+              });
+            }
+          }
+        }
+        state.buildings.push({ x, w, h, windows, color: `hsl(230, 15%, ${8 + Math.random() * 10}%)` });
+        x += w + 2 + Math.random() * 8;
+      }
+
+      state.streetlights = [];
+      for (let i = 0; i < CFG.streetlightCount; i++) {
+        state.streetlights.push({
+          x: (W / CFG.streetlightCount) * i + Math.random() * 60,
+          flicker: Math.random() * Math.PI * 2,
+        });
+      }
+    }
+
+    function drawCityBackground(now) {
+      // Sky
+      const sky = ctx.createLinearGradient(0, 0, 0, H * 0.4);
+      sky.addColorStop(0, "#0a0a1a");
+      sky.addColorStop(1, "#1a1a3e");
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, W, H * 0.4);
+
+      // Road
+      const road = ctx.createLinearGradient(0, H * 0.35, 0, H);
+      road.addColorStop(0, "#2a2a3a");
+      road.addColorStop(0.3, "#1e1e2a");
+      road.addColorStop(1, "#151520");
+      ctx.fillStyle = road;
+      ctx.fillRect(0, H * 0.35, W, H);
+
+      // Buildings
+      for (const b of state.buildings) {
+        ctx.fillStyle = b.color;
+        ctx.fillRect(b.x, H * 0.38 - b.h, b.w, b.h);
+        for (const win of b.windows) {
+          if (win.lit) {
+            ctx.fillStyle = win.color;
+            ctx.globalAlpha = 0.6 + Math.sin(now / 1000 + win.x * 0.1) * 0.15;
+            ctx.fillRect(b.x + win.x, H * 0.38 - b.h + win.y, 10, 14);
+            ctx.globalAlpha = 1;
+          }
+        }
+      }
+
+      // Scrolling lane dashes
+      state.laneOffset = (state.laneOffset + 0.5) % 40;
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([20, 20]);
+      for (let lane = 0; lane < 4; lane++) {
+        const y = H * 0.5 + lane * (H * 0.12);
+        ctx.beginPath();
+        ctx.lineDashOffset = -state.laneOffset;
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // Streetlights
+      for (const sl of state.streetlights) {
+        sl.flicker += 0.02;
+        const glow = 0.15 + Math.sin(sl.flicker) * 0.03;
+        // Pole
+        ctx.fillStyle = "#333";
+        ctx.fillRect(sl.x, H * 0.32, 4, H * 0.15);
+        // Arm
+        ctx.fillRect(sl.x - 8, H * 0.32, 20, 3);
+        // Glow
+        const glowGrad = ctx.createRadialGradient(sl.x + 2, H * 0.34, 0, sl.x + 2, H * 0.34, 60);
+        glowGrad.addColorStop(0, `rgba(255, 220, 150, ${glow})`);
+        glowGrad.addColorStop(1, "rgba(255, 220, 150, 0)");
+        ctx.fillStyle = glowGrad;
+        ctx.fillRect(sl.x - 58, H * 0.28, 120, 80);
+      }
+    }
+
+    // =========================================================
+    // CATCH PARTICLES
+    // =========================================================
+    function spawnCatchParticles(x, y, success) {
+      const count = success ? 15 : 8;
+      const color = success ? "rgba(255, 200, 50," : "rgba(200, 200, 200,";
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 2 + Math.random() * 5;
+        state.particles.push({
+          x, y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: 0.4 + Math.random() * 0.4,
+          maxLife: 0.4 + Math.random() * 0.4,
+          r: 3 + Math.random() * 5,
+          color,
+        });
+      }
+    }
+
+    function updateParticles(dt) {
+      for (let i = state.particles.length - 1; i >= 0; i--) {
+        const p = state.particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.15;
+        p.life -= dt;
+        if (p.life <= 0) state.particles.splice(i, 1);
+      }
+    }
+
+    function drawParticles(ctx) {
+      for (const p of state.particles) {
+        const alpha = Math.max(0, p.life / p.maxLife);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * alpha, 0, Math.PI * 2);
+        ctx.fillStyle = p.color + alpha.toFixed(2) + ")";
+        ctx.fill();
+      }
+    }
+
+    // =========================================================
+    // CATCH LOGIC
+    // =========================================================
+    function attemptCatch(hx, hy, now) {
+      let caught = false;
+      audio.honk();
+      spawnCatchParticles(hx, hy, false);
+
+      for (let i = state.cars.length - 1; i >= 0; i--) {
+        const car = state.cars[i];
+        if (car.caught) continue;
+        if (car.hitTest(hx, hy)) {
+          car.caught = true;
+          caught = true;
+
+          if (now - state.lastCatchTime < 2000) {
+            state.combo++;
+          } else {
+            state.combo = 1;
+          }
+          state.lastCatchTime = now;
+
+          const comboMult = Math.min(state.combo, 5);
+          const pts = car.points * comboMult;
+          state.score += pts;
+
+          state.catchFlash = { x: car.x, y: car.y, time: now, points: pts, combo: state.combo };
+
+          audio.vroom();
+          spawnCatchParticles(car.x, car.y, true);
+          state.cars.splice(i, 1);
+          break;
+        }
+      }
+
+      if (!caught) {
+        audio.pop();
+      }
+    }
+
+    // =========================================================
+    // SPAWNING
+    // =========================================================
+    function pickCarType() {
+      const totalWeight = CFG.carTypes.reduce((s, t) => s + t.weight, 0);
+      let r = Math.random() * totalWeight;
+      for (let i = 0; i < CFG.carTypes.length; i++) {
+        r -= CFG.carTypes[i].weight;
+        if (r <= 0) return i;
+      }
+      return 0;
+    }
+
+    function updateSpawning(dt, now) {
+      if (now - state.lastDifficultyUp > CFG.difficultyInterval && state.difficultyTier < CFG.maxDifficultyTier) {
+        state.difficultyTier++;
+        state.lastDifficultyUp = now;
+      }
+      const spawnRate = CFG.baseCarsPerSec * Math.pow(CFG.difficultySpawnMult, state.difficultyTier);
+      state.spawnAccum += dt * spawnRate;
+      while (state.spawnAccum >= 1) {
+        state.spawnAccum -= 1;
+        state.cars.push(new Car(pickCarType()));
+      }
+    }
+
+    // =========================================================
+    // GAME LOGIC
+    // =========================================================
+    function updateGame(dt, now) {
+      updateSpawning(dt, now);
+
+      for (let i = state.cars.length - 1; i >= 0; i--) {
+        const car = state.cars[i];
+        car.update(dt);
+        if (car.offscreen && !car.caught) {
+          state.cars.splice(i, 1);
+          state.lives--;
+          state.shakeUntil = now + 300;
+          audio.screech();
+          if (state.lives <= 0) { endGame(now); return; }
+        }
+      }
+
+      updateParticles(dt);
+    }
+
+    function startGame(now) {
+      audio.init();
+      state.phase = "playing";
+      state.score = 0;
+      state.lives = CFG.lives;
+      state.cars = [];
+      state.particles = [];
+      state.combo = 0;
+      state.mouths = [];
+      state.difficultyTier = 0;
+      state.spawnAccum = 0;
+      state.catchFlash = null;
+      state.gameStartTime = now;
+      state.lastDifficultyUp = now;
+      state.lastCatchTime = 0;
+      initBuildings();
+    }
+
+    function endGame(now) {
+      state.phase = "gameover";
+      if (state.score > state.highScore) {
+        state.highScore = state.score;
+        localStorage.setItem("carsCars_high", String(state.highScore));
+      }
+      audio.gameOver();
+    }
+
+    // =========================================================
+    // RENDERING
+    // =========================================================
+    function drawCameraFeed() {
+      if (!camReady) return;
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, W, H);
+      ctx.restore();
+    }
+
+    function drawMouths(now) {
+      if (state.mouths.length === 0) return;
+
+      const colors = [
+        { open: "57, 211, 83", closed: "150, 220, 255" },
+        { open: "255, 150, 50", closed: "255, 200, 120" },
+        { open: "200, 100, 255", closed: "180, 150, 255" },
+        { open: "255, 100, 150", closed: "255, 180, 200" },
+      ];
+
+      for (let mi = 0; mi < state.mouths.length; mi++) {
+        const mouth = state.mouths[mi];
+        const col = colors[mi % colors.length];
+        const hx = mouth.x * W;
+        const hy = mouth.y * H;
+        const openness = mouth.jawOpenVal;
+        const baseRadius = CFG.catchRadius * 0.5;
+        const radius = baseRadius + openness * CFG.catchRadius * 0.8;
+        const isOpen = mouth.mouthOpen;
+
+        ctx.beginPath();
+        ctx.arc(hx, hy, radius + 10, 0, Math.PI * 2);
+        ctx.fillStyle = isOpen ? `rgba(${col.open}, 0.15)` : `rgba(${col.closed}, 0.08)`;
+        ctx.fill();
+
+        const mouthWidth = radius * 1.3;
+        const mouthHeight = radius * (0.4 + openness * 1.2);
+
+        ctx.beginPath();
+        ctx.ellipse(hx, hy, mouthWidth, mouthHeight, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = isOpen ? `rgba(${col.open}, 0.6)` : `rgba(${col.closed}, 0.3)`;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+
+        if (openness > 0.2) {
+          const alpha = Math.min(1, (openness - 0.2) * 2);
+          ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.7})`;
+          const teethCount = 6;
+          for (let i = 0; i < teethCount; i++) {
+            const t = (i + 0.5) / teethCount;
+            const angle = -Math.PI * 0.8 + t * Math.PI * 1.6;
+            const tx = hx + Math.cos(angle) * mouthWidth * 0.85;
+            const ty = hy + Math.sin(angle) * mouthHeight * 0.85;
+            ctx.beginPath(); ctx.moveTo(tx - 4, ty); ctx.lineTo(tx, ty + 8); ctx.lineTo(tx + 4, ty); ctx.closePath(); ctx.fill();
+            const bAngle = Math.PI * 0.8 - t * Math.PI * 1.6;
+            const bx = hx + Math.cos(bAngle) * mouthWidth * 0.85;
+            const by = hy + Math.sin(bAngle) * mouthHeight * 0.85;
+            ctx.beginPath(); ctx.moveTo(bx - 4, by); ctx.lineTo(bx, by - 8); ctx.lineTo(bx + 4, by); ctx.closePath(); ctx.fill();
+          }
+        }
+
+        if (isOpen) {
+          ctx.beginPath();
+          ctx.arc(hx, hy, radius * 0.2, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${col.open}, 0.4)`;
+          ctx.fill();
+        }
+      }
+    }
+
+    function drawHUD(now) {
+      ctx.fillStyle = "#e6f1ff";
+      ctx.font = "bold 28px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(`Score: ${state.score}`, 20, 40);
+
+      ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText(`Best: ${state.highScore}`, 20, 62);
+
+      ctx.textAlign = "right";
+      ctx.font = "28px sans-serif";
+      let livesStr = "";
+      for (let i = 0; i < CFG.lives; i++) livesStr += i < state.lives ? "\u{1F697}" : "\u{1F4A5}";
+      ctx.fillText(livesStr, W - 20, 40);
+
+      ctx.font = "14px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.textAlign = "right";
+      const elapsed = Math.floor((now - state.gameStartTime) / 1000);
+      ctx.fillText(`Level: ${state.difficultyTier + 1}  |  ${elapsed}s`, W - 20, 62);
+
+      if (state.combo > 1 && now - state.lastCatchTime < 2000) {
+        ctx.textAlign = "center";
+        ctx.font = "bold 22px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#ffeb3b";
+        ctx.fillText(`${state.combo}x COMBO`, W / 2, 40);
+      }
+
+      if (state.catchFlash && now - state.catchFlash.time < 1000) {
+        const t = (now - state.catchFlash.time) / 1000;
+        ctx.save();
+        ctx.globalAlpha = 1 - t;
+        ctx.textAlign = "center";
+        ctx.font = "bold 32px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#ffeb3b";
+        ctx.fillText(`+${state.catchFlash.points}`, state.catchFlash.x, state.catchFlash.y - t * 60);
+        ctx.restore();
+      }
+    }
+
+    function drawStartScreen() {
+      drawCityBackground(performance.now());
+
+      const demoTime = performance.now() / 1000;
+
+      ctx.save();
+      ctx.globalAlpha = 0.4;
+      const demoCar1 = new Car(0);
+      demoCar1.x = W * 0.25 + Math.sin(demoTime * 0.4) * 60;
+      demoCar1.y = H * 0.45;
+      demoCar1.wheelPhase = demoTime * 5;
+      demoCar1.facingLeft = false;
+      demoCar1.draw(ctx);
+
+      const demoCar2 = new Car(3);
+      demoCar2.x = W * 0.7 + Math.sin(demoTime * 0.3 + 1) * 40;
+      demoCar2.y = H * 0.6;
+      demoCar2.wheelPhase = demoTime * 3;
+      demoCar2.facingLeft = true;
+      demoCar2.draw(ctx);
+      ctx.restore();
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ffeb3b";
+      ctx.font = "bold 56px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("\u{1F697} Cars Cars \u{1F697}", W / 2, H * 0.25);
+
+      ctx.font = "22px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText("Catch cars with your mouth! CHOMP!", W / 2, H * 0.32);
+
+      ctx.font = "18px -apple-system, BlinkMacSystemFont, sans-serif";
+      if (!camReady) {
+        ctx.fillStyle = "#f0883e";
+        ctx.fillText("Waiting for camera access...", W / 2, H * 0.55);
+      } else if (!modelReady) {
+        ctx.fillStyle = "#f0883e";
+        ctx.fillText("Loading face tracking model...", W / 2, H * 0.55);
+      } else {
+        ctx.fillStyle = "#39d353";
+        ctx.fillText("Camera ready! Face tracking loaded.", W / 2, H * 0.53);
+
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("Open your mouth wide to CHOMP a car", W / 2, H * 0.59);
+        ctx.fillText("Green = 1pt   Rainbow = 2pt   Tesla = 3pt   Cybertruck = 5pt", W / 2, H * 0.63);
+        ctx.fillText("Don't let them drive away! You have 8 lives.", W / 2, H * 0.67);
+
+        const pulse = 0.7 + Math.sin(demoTime * 3) * 0.3;
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#ffeb3b";
+        ctx.font = "bold 24px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("Click or tap anywhere to start", W / 2, H * 0.78);
+        ctx.globalAlpha = 1;
+      }
+
+      if (state.highScore > 0) {
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText(`High score: ${state.highScore}`, W / 2, H * 0.88);
+      }
+    }
+
+    function drawGameOverScreen(now) {
+      drawCityBackground(now);
+
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.textAlign = "center";
+
+      ctx.fillStyle = "#f85149";
+      ctx.font = "bold 48px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("Game Over", W / 2, H * 0.3);
+
+      ctx.fillStyle = "#e6f1ff";
+      ctx.font = "bold 36px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText(`Score: ${state.score}`, W / 2, H * 0.42);
+
+      const isNew = state.score >= state.highScore && state.score > 0;
+      if (isNew) {
+        ctx.fillStyle = "#ffeb3b";
+        ctx.font = "bold 22px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("New high score!", W / 2, H * 0.50);
+      } else {
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "18px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText(`Best: ${state.highScore}`, W / 2, H * 0.50);
+      }
+
+      ctx.fillStyle = "#8b949e";
+      ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+      const duration = Math.floor((now - state.gameStartTime) / 1000);
+      ctx.fillText(`Survived ${duration} seconds  |  Reached level ${state.difficultyTier + 1}`, W / 2, H * 0.58);
+
+      const pulse = 0.7 + Math.sin(now / 1000 * 3) * 0.3;
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#ffeb3b";
+      ctx.font = "bold 24px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("Click or tap to play again", W / 2, H * 0.72);
+      ctx.globalAlpha = 1;
+    }
+
+    // =========================================================
+    // MAIN LOOP
+    // =========================================================
+    let lastTime = 0;
+
+    function loop(timestamp) {
+      requestAnimationFrame(loop);
+
+      const now = timestamp || performance.now();
+      const rawDt = lastTime ? (now - lastTime) / 1000 : 0.016;
+      const dt = Math.min(rawDt, 0.1);
+      lastTime = now;
+
+      let shakeX = 0, shakeY = 0;
+      if (now < state.shakeUntil) {
+        shakeX = (Math.random() - 0.5) * 8;
+        shakeY = (Math.random() - 0.5) * 8;
+      }
+
+      ctx.save();
+      ctx.translate(shakeX, shakeY);
+
+      detectFace(now);
+
+      if (state.phase === "start") {
+        drawStartScreen();
+      } else if (state.phase === "playing") {
+        updateGame(dt, now);
+        drawCityBackground(now);
+        drawCameraFeed();
+        for (const car of state.cars) car.draw(ctx);
+        drawParticles(ctx);
+        drawMouths(now);
+        drawHUD(now);
+      } else if (state.phase === "gameover") {
+        updateParticles(dt);
+        drawGameOverScreen(now);
+      }
+
+      ctx.restore();
+    }
+
+    // =========================================================
+    // INPUT
+    // =========================================================
+    canvas.addEventListener("click", () => {
+      audio.init();
+      if (state.phase === "start" && camReady && modelReady) startGame(performance.now());
+      else if (state.phase === "gameover") startGame(performance.now());
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        audio.init();
+        if (state.phase === "start" && camReady && modelReady) startGame(performance.now());
+        else if (state.phase === "gameover") startGame(performance.now());
+      }
+    });
+
+    // =========================================================
+    // INIT
+    // =========================================================
+    async function init() {
+      initBuildings();
+      await Promise.all([initWebcam(), initMediaPipe()]);
+    }
+
+    init();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
